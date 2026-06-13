@@ -2,6 +2,7 @@
 #include "SPISlave.h"
 #include "DigitalIO.h"
 #include "ADC.h"
+#include "FWUpdate.h"
 #include "Registers.h"
 
 static const uint8_t PWM_FREQ_REGS[4][2] = {
@@ -15,6 +16,7 @@ void setup() {
     SPISlaveInit();
     DigitalIOInit();
     ADCInit();
+    FWUpdateInit();
 }
 
 void loop() {
@@ -33,6 +35,10 @@ void loop() {
     }
 
     SPISlaveUpdate();
+
+    // Process firmware-update commands and flush any streamed block to flash.
+    // All LittleFS/flash work is confined here, outside the SPI critical path.
+    FWUpdateUpdate();
 
     // Level-driven INT: assert while any unmasked flag is pending, deassert
     // once the ESP32 reads (and thereby clears) INT_FLAGS. Masked flags still

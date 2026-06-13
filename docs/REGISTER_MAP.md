@@ -210,9 +210,16 @@ latches bytes 1–3.
 
 ### Firmware update `0x60`–`0x73`
 
-Stub addresses reserved for the field-update protocol (`REG_FW_CMD`,
-`REG_FW_STATUS`, `REG_FW_BLOCK_ADDR*`, `REG_FW_BLOCK_SIZE*`, `REG_FW_DATA_PORT`,
-`REG_FW_CRC32_*`). Not yet implemented.
+| Addr | Name                  | Acc | Description                                      |
+|------|-----------------------|-----|--------------------------------------------------|
+| 0x60 | `REG_FW_CMD`          | W   | Write a `FW_CMD_*` value to drive the update     |
+| 0x61 | `REG_FW_STATUS`       | R   | Current `FW_ST_*` state                          |
+| 0x62–0x65 | `REG_FW_BLOCK_ADDR*` | R/W | Host bookkeeping (informational), image offset, LE |
+| 0x66–0x67 | `REG_FW_BLOCK_SIZE*` | R/W | Host bookkeeping (informational), block length, LE |
+| 0x68 | `REG_FW_DATA_PORT`    | W   | Stream image bytes here (burst write, **non-incrementing**) |
+| 0x70–0x73 | `REG_FW_CRC32_*`  | R/W | Expected CRC32 of the streamed image, LE         |
+
+See [§9](#9-firmware-update) for the full protocol.
 
 ---
 
@@ -242,6 +249,7 @@ the host polls their value registers (`0x50`–`0x5F`).
 | 0x08 | `ERR_SPI_TIMEOUT`     | SCK stalled mid-transaction                    |
 | 0x10 | `ERR_SPI_DESYNC`      | Stale FIFO bytes flushed at idle               |
 | 0x20 | `ERR_DI_MODE`         | Invalid input mode (e.g. half an encoder pair) |
+| 0x40 | `ERR_FW`              | Firmware-update failure (FS mount, overflow, sequence) |
 
 ---
 
@@ -336,4 +344,77 @@ Enable encoder 0 (inputs 0 & 1) and zero its position:
 write REG_DI_MODE  (0x1A) = 0x05   ; input0=ENCODER(1), input1=ENCODER(1)
 write REG_CNT_CLEAR(0x1C) = 0x01   ; zero the pair
 ; read signed position from 0x50..0x53 (byte 0 first)
+```
+
+---
+
+## 9. Firmware update
+
+The host can replace the RP2040 application image over SPI. The new image is
+streamed into a 512 KB LittleFS staging partition, CRC-verified, then applied on
+the next boot by the core's always-present, power-fail-safe OTA bootloader.
+**Raw `.bin` and GZIP images are both accepted** — the bootloader auto-detects a
+GZIP header and decompresses during the copy.
+
+### Commands — `REG_FW_CMD` (0x60, write)
+
+| Value | Name | Action |
+|-------|------|--------|
+| 0x01 | `FW_CMD_BEGIN`  | Open/truncate staging, reset CRC, suspend I/O → `READY` |
+| 0x02 | `FW_CMD_END`    | Flush, close, compare CRC32 → `VERIFY_OK` / `VERIFY_FAIL` |
+| 0x03 | `FW_CMD_COMMIT` | If `VERIFY_OK`: schedule OTA and **reboot** |
+| 0x04 | `FW_CMD_ABORT`  | Discard staging, restore I/O → `IDLE` |
+
+### Status — `REG_FW_STATUS` (0x61, read-only)
+
+| Value | Name | Meaning |
+|-------|------|---------|
+| 0x00 | `FW_ST_IDLE`        | No update session |
+| 0x01 | `FW_ST_READY`       | Ready to receive a block / between blocks |
+| 0x02 | `FW_ST_BUSY`        | Flushing a block to flash |
+| 0x03 | `FW_ST_VERIFY_OK`   | Streamed CRC matched; ready to `COMMIT` |
+| 0x04 | `FW_ST_VERIFY_FAIL` | CRC mismatch |
+| 0x05 | `FW_ST_ERROR`       | FS / overflow / sequence error (see `REG_ERROR` bit `ERR_FW`) |
+
+### Protocol
+
+1. `REG_FW_CMD = BEGIN`; poll `REG_FW_STATUS` until `READY`.
+2. For each block (**≤ 4096 bytes**): burst-write the block's bytes to
+   `REG_FW_DATA_PORT` (one command byte, then stream the data bytes, then
+   deassert CS — the address does **not** auto-increment), then poll
+   `REG_FW_STATUS` until it returns to `READY` (the device has flushed the
+   block to flash). Repeat for the whole image.
+3. Write the full-image CRC32 to `REG_FW_CRC32_0..3` (little-endian), then
+   `REG_FW_CMD = END`. Read `REG_FW_STATUS`: `VERIFY_OK` or `VERIFY_FAIL`.
+4. On `VERIFY_OK`, `REG_FW_CMD = COMMIT`. The device schedules the image and
+   reboots; the bootloader applies it. On `VERIFY_FAIL`, retry from step 1 or
+   `ABORT`.
+
+> **CRC32** is the standard reflected CRC-32 (polynomial `0xEDB88320`, init
+> `0xFFFFFFFF`, final XOR `0xFFFFFFFF`) computed over **exactly the bytes the
+> host streams** — i.e. the gzip bytes if sending a gzip image.
+
+> **During an update, normal I/O is suspended** (inputs/interrupts are quiesced
+> so no flash-resident ISR runs during LittleFS writes). Do not expect live I/O
+> between `BEGIN` and the post-`COMMIT` reboot.
+
+> **Blocks are CS-delimited.** Each burst write to `REG_FW_DATA_PORT` is one
+> block; keep it ≤ 4096 bytes or the device sets `ERR_FW` / `FW_ST_ERROR`.
+
+### Example
+
+```
+write REG_FW_CMD (0x60) = 0x01            ; BEGIN
+poll  REG_FW_STATUS (0x61) == 0x01        ; READY
+
+loop over 4 KB blocks:
+  TX: 0x00|0x68  (write REG_FW_DATA_PORT)  ; command byte
+  TX: <byte 0> <byte 1> … <byte N-1>       ; stream block, then deassert CS
+  poll REG_FW_STATUS (0x61) == 0x01        ; READY (block flushed)
+
+write REG_FW_CRC32_0..3 (0x70..0x73) = crc32(image)   ; little-endian
+write REG_FW_CMD (0x60) = 0x02            ; END
+read  REG_FW_STATUS (0x61)                ; 0x03 VERIFY_OK | 0x04 VERIFY_FAIL
+
+write REG_FW_CMD (0x60) = 0x03            ; COMMIT → reboots into new image
 ```

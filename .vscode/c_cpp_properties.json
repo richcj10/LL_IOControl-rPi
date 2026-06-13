@@ -433,7 +433,7 @@
                 "F_CPU=133000000L",
                 "BOARD_NAME=\"rpipico\"",
                 "PICO_FLASH_SIZE_BYTES=2097152",
-                "FS_START=270528512",
+                "FS_START=270004224",
                 "FS_END=270528512",
                 "FILE_COPY_CONSTRUCTOR_SELECT=FILE_COPY_CONSTRUCTOR_PUBLIC",
                 "USE_UTF8_LONG_NAMES=1",

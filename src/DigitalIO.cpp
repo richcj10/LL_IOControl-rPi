@@ -105,6 +105,17 @@ static void configureInterrupts() {
     irq_set_enabled(IO_IRQ_BANK0, true);
 }
 
+void DigitalIOSuspendInputs() {
+    const uint32_t bothEdges = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;
+    for (int i = 0; i < 4; i++) {
+        gpio_set_irq_enabled(INPUT_PINS[i], bothEdges, false);
+    }
+}
+
+void DigitalIOResumeInputs() {
+    configureInterrupts();
+}
+
 void DigitalIOInit() {
     for (int i = 0; i < 7; i++) {
         pinMode(OUTPUT_PINS[i], OUTPUT);

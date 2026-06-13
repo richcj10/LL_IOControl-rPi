@@ -1,5 +1,6 @@
 #include "SPISlave.h"
 #include "Registers.h"
+#include "FWUpdate.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/timer.h"
@@ -19,6 +20,7 @@ volatile uint8_t regMap[256];
 volatile uint8_t pwmFreqPending = 0;
 volatile uint8_t diReconfigPending = 0;
 volatile uint8_t cntClearPending = 0;
+volatile uint8_t fwCmdPending = 0;
 
 // H bytes latched on the matching L-byte read so 16-bit ADC values can't tear
 static uint8_t adcLatchH[4];
@@ -165,6 +167,20 @@ static SpiServe spiServeReadByte(uint8_t val) {
     return SPI_SERVE_SENT;
 }
 
+// Receive one streamed byte for a firmware-data burst write. Like a normal
+// mid-transaction read, but a CS deassert between bytes is the NORMAL end of a
+// streamed block (CSEND) rather than an abort.
+static SpiServe spiRecvStreamByte(uint8_t *out) {
+    spi_hw_t *hw = spi_get_hw(spi1);
+    uint32_t start = time_us_32();
+    while (!(hw->sr & SPI_SSPSR_RNE_BITS)) {
+        if (gpio_get(PIN_CS)) return SPI_SERVE_CSEND;
+        if ((time_us_32() - start) > SPI_BYTE_TIMEOUT_US) return SPI_SERVE_TIMEOUT;
+    }
+    *out = (uint8_t)hw->dr;
+    return SPI_SERVE_SENT;
+}
+
 void SPISlaveUpdate() {
     spi_hw_t *hw = spi_get_hw(spi1);
 
@@ -212,6 +228,23 @@ void SPISlaveUpdate() {
         // Drop the speculatively-queued byte the master never clocked so the
         // next frame starts aligned regardless of when the idle poll runs.
         spiFlushFifos();
+    } else if (addr == REG_FW_DATA_PORT) {
+        // Streaming firmware-image write: every clocked byte goes to the data
+        // port (no auto-increment) and is buffered for the main loop to flush
+        // to LittleFS. Ends when the master deasserts CS.
+        for (;;) {
+            uint8_t b;
+            SpiServe r = spiRecvStreamByte(&b);
+            if (r == SPI_SERVE_SENT) {
+                FWUpdateFeed(b);
+                continue;
+            }
+            if (r == SPI_SERVE_TIMEOUT) {
+                regMap[REG_ERROR] |= ERR_SPI_TIMEOUT;
+            }
+            break; // SPI_SERVE_CSEND = clean end of the block
+        }
+        spiFlushFifos();
     } else {
         uint8_t val = 0;
         if (!spiReadByteBlocking(&val)) {
@@ -250,6 +283,11 @@ void regWrite(uint8_t addr, uint8_t val) {
     if (addr == REG_CNT_CLEAR) {
         cntClearPending |= val;
         regMap[REG_CNT_CLEAR] = 0;
+    }
+
+    // Firmware-update commands touch LittleFS/flash; defer to the main loop
+    if (addr == REG_FW_CMD) {
+        fwCmdPending = val;
     }
 }
 

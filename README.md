@@ -13,6 +13,9 @@ inputs through an 8-bit register file over SPI.
   - **ENCODER** — quadrature ×4 decode → signed 32-bit position (2 pairs),
   - **FREQUENCY** — edge frequency → Hz, configurable edge & window.
 - **Interrupt line** to the host for digital-input changes.
+- **Firmware update over SPI** — host streams a raw or GZIP image into a LittleFS
+  staging partition; applied on next boot by the core's power-fail-safe OTA
+  bootloader.
 
 ## Interface
 
@@ -36,4 +39,5 @@ pio run -t upload  # flash
 | [src/SPISlave.cpp](src/SPISlave.cpp) | SPI-slave transaction handling, register file |
 | [src/DigitalIO.cpp](src/DigitalIO.cpp) | Inputs (level/encoder/frequency), outputs, PWM |
 | [src/ADC.cpp](src/ADC.cpp)         | ADC sampling and filtering |
+| [src/FWUpdate.cpp](src/FWUpdate.cpp) | SPI firmware-update state machine, staging, OTA commit |
 | [src/Registers.h](src/Registers.h) | Register addresses and bit definitions |

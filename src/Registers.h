@@ -28,6 +28,7 @@ constexpr uint8_t ERR_SPI_ABORT      = 0x04; ///< CS deasserted mid-transaction
 constexpr uint8_t ERR_SPI_TIMEOUT    = 0x08; ///< SPI clock stalled mid-transaction
 constexpr uint8_t ERR_SPI_DESYNC     = 0x10; ///< Stale FIFO bytes flushed at idle (aborted/extra frame)
 constexpr uint8_t ERR_DI_MODE        = 0x20; ///< Invalid input-mode config (e.g. only one pin of an encoder pair)
+constexpr uint8_t ERR_FW             = 0x40; ///< Firmware-update failure (FS mount, buffer overflow, bad sequence)
 /// @}
 
 // Digital IO 0x10–0x1F
@@ -109,18 +110,38 @@ constexpr uint8_t REG_CNT2_0 = 0x58; ///< Input 2, bytes 0x58–0x5B
 constexpr uint8_t REG_CNT3_0 = 0x5C; ///< Input 3, bytes 0x5C–0x5F
 constexpr uint8_t REG_CNT_END = 0x5F;
 
-// Firmware update 0x60–0x73 (stub addresses)
-// Moved from 0xE0-0xF3: the 7-bit SPI address field cannot reach above 0x7F.
-constexpr uint8_t REG_FW_CMD         = 0x60;
-constexpr uint8_t REG_FW_STATUS      = 0x61;
-constexpr uint8_t REG_FW_BLOCK_ADDR0 = 0x62;
+// Firmware update 0x60–0x73
+// The host streams a (raw or GZIP) image to REG_FW_DATA_PORT in blocks, sets the
+// expected CRC32, then commits. The staged image is applied on the next boot by
+// the core's always-present OTA bootloader. See docs/REGISTER_MAP.md §Firmware update.
+constexpr uint8_t REG_FW_CMD         = 0x60; ///< Write a FW_CMD_* value to drive the update
+constexpr uint8_t REG_FW_STATUS      = 0x61; ///< Read-only FW_ST_* state
+constexpr uint8_t REG_FW_BLOCK_ADDR0 = 0x62; ///< Host bookkeeping (informational); image offset, LE
 constexpr uint8_t REG_FW_BLOCK_ADDR1 = 0x63;
 constexpr uint8_t REG_FW_BLOCK_ADDR2 = 0x64;
 constexpr uint8_t REG_FW_BLOCK_ADDR3 = 0x65;
-constexpr uint8_t REG_FW_BLOCK_SIZE0 = 0x66;
+constexpr uint8_t REG_FW_BLOCK_SIZE0 = 0x66; ///< Host bookkeeping (informational); block length, LE
 constexpr uint8_t REG_FW_BLOCK_SIZE1 = 0x67;
-constexpr uint8_t REG_FW_DATA_PORT   = 0x68;
-constexpr uint8_t REG_FW_CRC32_0     = 0x70;
+constexpr uint8_t REG_FW_DATA_PORT   = 0x68; ///< Stream image bytes here (burst write, non-incrementing)
+constexpr uint8_t REG_FW_CRC32_0     = 0x70; ///< Expected CRC32 of the streamed image, LE
 constexpr uint8_t REG_FW_CRC32_1     = 0x71;
 constexpr uint8_t REG_FW_CRC32_2     = 0x72;
 constexpr uint8_t REG_FW_CRC32_3     = 0x73;
+
+/// @name REG_FW_CMD command values
+/// @{
+constexpr uint8_t FW_CMD_BEGIN  = 0x01; ///< Open/truncate staging, reset CRC, suspend I/O → READY
+constexpr uint8_t FW_CMD_END    = 0x02; ///< Flush, close, compare CRC → VERIFY_OK / VERIFY_FAIL
+constexpr uint8_t FW_CMD_COMMIT = 0x03; ///< If VERIFY_OK: schedule OTA and reboot
+constexpr uint8_t FW_CMD_ABORT  = 0x04; ///< Discard staging, restore I/O → IDLE
+/// @}
+
+/// @name REG_FW_STATUS state values
+/// @{
+constexpr uint8_t FW_ST_IDLE        = 0x00; ///< No update session
+constexpr uint8_t FW_ST_READY       = 0x01; ///< Ready to receive a block / between blocks
+constexpr uint8_t FW_ST_BUSY        = 0x02; ///< Flushing a block to flash
+constexpr uint8_t FW_ST_VERIFY_OK   = 0x03; ///< Streamed CRC matched; ready to COMMIT
+constexpr uint8_t FW_ST_VERIFY_FAIL = 0x04; ///< CRC mismatch
+constexpr uint8_t FW_ST_ERROR       = 0x05; ///< FS / overflow / sequence error (see REG_ERROR)
+/// @}

@@ -15,6 +15,9 @@ extern volatile uint8_t diReconfigPending;
 // and consumed by the main loop.
 extern volatile uint8_t cntClearPending;
 
+// Last REG_FW_CMD value written; consumed by FWUpdateUpdate() in the main loop.
+extern volatile uint8_t fwCmdPending;
+
 void SPISlaveInit();
 void SPISlaveUpdate();
 void setINT(bool assert);
