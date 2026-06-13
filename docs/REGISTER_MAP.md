@@ -144,7 +144,16 @@ Samples are 12-bit ADC readings left-shifted to 16-bit, then IIR-filtered.
 
 ### PWM frequency `0x40`–`0x47` (write L then H)
 
-Slice 0 = GP0/GP1, slice 1 = GP2/GP3, slice 2 = GP4/GP5, slice 3 = GP6.
+These set PWM **frequency**, not duty cycle. Duty is set separately, per output
+channel, via `REG_OUT_VAL_n` (`0x13`–`0x19`, 0–255 ↦ 0–100%) with the channel
+in PWM mode (`REG_OUT_MODE` bit set).
+
+Frequency is **per slice**, and a slice drives a *pair* of pins:
+slice 0 = GP0/GP1, slice 1 = GP2/GP3, slice 2 = GP4/GP5, slice 3 = GP6. So the
+two pins on a slice **share one frequency** but each keeps its **own duty
+cycle** (e.g. GP0 at 25 % and GP1 at 75 % at the same Hz). Changing a slice's
+frequency rescales every PWM channel on it so duty % stays constant.
+
 Frequency in Hz, 16-bit; applied on the H-byte write. Floor ≈ 7.46 Hz
 (below it `ERR_PWM_FREQ_RANGE` is set and the value is clamped).
 
