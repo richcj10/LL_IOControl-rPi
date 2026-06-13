@@ -54,14 +54,41 @@ Every transaction is **2 bytes**: a command byte followed by one data byte.
 Master sends the command byte, then the value byte. The register updates on
 receipt of the value.
 
-### Read `[cmd=0x80|addr] [dummy]`
-Master sends the command byte, then clocks a second (dummy) byte; the device
-returns the register value on that second byte.
+### Read `[cmd=0x80|addr] [dummy] [dummy] …`
+Master sends the command byte, then clocks dummy bytes to read data. The device
+returns the register value on the second byte, and **auto-increments** the
+address for every further byte clocked — so you don't re-send the address for
+sequential registers. The master ends the burst simply by deasserting CS.
 
-> CS must stay asserted for both bytes. Deasserting CS mid-transaction, or
-> stalling SCK past the byte timeout, aborts the frame and sets an error bit
-> (`ERR_SPI_ABORT` / `ERR_SPI_TIMEOUT`). Stale FIFO bytes left at idle set
-> `ERR_SPI_DESYNC` and are flushed.
+```
+TX: 0x80|0x50   RX: —     (command byte; RX discarded)
+TX: 0x00        RX: b0    (regMap[0x50])
+TX: 0x00        RX: b1    (regMap[0x51])
+TX: 0x00        RX: b2    (regMap[0x52])
+TX: 0x00        RX: b3    (regMap[0x53])   ← deassert CS to stop
+```
+
+The address wraps within the 7-bit space (`0x7F → 0x00`). A single-register
+read is just a burst of length one. Multi-byte latching ([§3](#3-multi-byte-values-tear-free-reads))
+composes naturally: a burst starting at byte 0 of an ADC/counter value latches
+the rest on the first byte and reads the latch on the following bytes, so the
+whole value is coherent.
+
+> **Burst writes are not supported** — writes are always a single
+> `[cmd][value]` pair. Only reads auto-increment.
+
+> CS must stay asserted for the whole transaction. Deasserting CS *mid-byte*,
+> or stalling SCK past the byte timeout, aborts the frame and sets an error bit
+> (`ERR_SPI_ABORT` on a write / `ERR_SPI_TIMEOUT`). Ending a read burst by
+> deasserting CS *between* bytes is normal and is **not** an error. Unconsumed
+> RX bytes left at idle set `ERR_SPI_DESYNC` and are flushed.
+
+> **Timing:** after the command byte, allow the slave a moment to enter the
+> transaction before clocking data (the slave services SPI from its polled main
+> loop, which can be busy for up to ~1 ms). Once the burst is flowing, data
+> bytes are served from a tight loop; keep the clock moderate (or insert small
+> inter-byte gaps) so the slave can stage each next byte, especially while
+> encoder interrupts are active.
 
 ---
 
@@ -289,15 +316,19 @@ write REG_DI_EDGE_CFG (0x1B) = 0x02   ; input0 = both edges
 write REG_FREQ_WINDOW (0x1D) = 50     ; 50 × 10 ms = 500 ms
 ```
 
-Read input 0 frequency (Hz), 32-bit:
+Read input 0 frequency (Hz), 32-bit — single burst, address sent once:
 
 ```
-TX: 0x80|0x50  RX: b0   ← latches b1..b3
-TX: 0x80|0x51  RX: b1
-TX: 0x80|0x52  RX: b2
-TX: 0x80|0x53  RX: b3
+TX: 0x80|0x50  RX: —    ; command (read, addr 0x50)
+TX: 0x00       RX: b0   ; regMap[0x50], latches b1..b3
+TX: 0x00       RX: b1   ; regMap[0x51]
+TX: 0x00       RX: b2   ; regMap[0x52]
+TX: 0x00       RX: b3   ; regMap[0x53]  → deassert CS
 hz = b0 | (b1<<8) | (b2<<16) | (b3<<24)
 ```
+
+The same burst can keep going to sweep contiguous registers — e.g. start at
+`0x50` and clock 16 bytes to read all four 32-bit input values in one frame.
 
 Enable encoder 0 (inputs 0 & 1) and zero its position:
 

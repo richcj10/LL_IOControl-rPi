@@ -104,39 +104,80 @@ static bool spiReadByteBlocking(uint8_t *out) {
     return true;
 }
 
-// Queue a response byte and wait for the master to clock it out, with the
-// same CS/timeout bailouts. The aborted byte is left in the TX FIFO and gets
-// flushed on the next idle pass.
-static bool spiWriteByteBlocking(uint8_t val) {
+// Read a register value for a read transaction, applying the multi-byte latch
+// rules: the first byte of an ADC/counter value snapshots the rest so a wide
+// value can't tear — across either a burst or separate single transactions.
+static uint8_t spiReadRegister(uint8_t addr) {
+    uint8_t val = regMap[addr];
+
+    // L-byte read latches the H byte; H-byte read returns the latch
+    if (addr >= REG_ADC0_L && addr <= REG_ADC3_H) {
+        uint8_t idx = (uint8_t)((addr - REG_ADC0_L) >> 1);
+        if (((addr - REG_ADC0_L) & 1) == 0) {
+            adcLatchH[idx] = regMap[addr + 1];
+        } else {
+            val = adcLatchH[idx];
+        }
+    }
+
+    // Byte-0 read latches the upper 3 bytes; later byte reads return the latch
+    if (addr >= REG_CNT0_0 && addr <= REG_CNT_END) {
+        uint8_t idx = (uint8_t)((addr - REG_CNT0_0) >> 2);
+        uint8_t off = (uint8_t)((addr - REG_CNT0_0) & 3);
+        if (off == 0) {
+            cntLatch[idx][0] = regMap[addr + 1];
+            cntLatch[idx][1] = regMap[addr + 2];
+            cntLatch[idx][2] = regMap[addr + 3];
+        } else {
+            val = cntLatch[idx][off - 1];
+        }
+    }
+
+    return val;
+}
+
+// Clear-on-read side effects, applied only after a byte is actually clocked
+// out — never for a speculatively-prepared byte the master chooses to skip.
+static void spiReadClear(uint8_t addr) {
+    if (addr == REG_INT_FLAGS) regMap[REG_INT_FLAGS] = 0;
+    if (addr == REG_ERROR)     regMap[REG_ERROR]     = 0;
+}
+
+// Result of trying to clock out one response byte.
+enum SpiServe { SPI_SERVE_SENT, SPI_SERVE_CSEND, SPI_SERVE_TIMEOUT };
+
+// Queue one response byte and wait for the master to clock it out. Unlike a
+// mid-byte abort, a CS deassert here is the NORMAL end of a read burst (the
+// master stops once it has the bytes it wants), so it returns CSEND rather
+// than flagging an error.
+static SpiServe spiServeReadByte(uint8_t val) {
     spi_hw_t *hw = spi_get_hw(spi1);
     hw->dr = (uint32_t)val;
     uint32_t start = time_us_32();
     while (hw->sr & SPI_SSPSR_BSY_BITS) {
-        if (gpio_get(PIN_CS)) {
-            regMap[REG_ERROR] |= ERR_SPI_ABORT;
-            return false;
-        }
-        if ((time_us_32() - start) > SPI_BYTE_TIMEOUT_US) {
-            regMap[REG_ERROR] |= ERR_SPI_TIMEOUT;
-            return false;
-        }
+        if (gpio_get(PIN_CS)) return SPI_SERVE_CSEND;
+        if ((time_us_32() - start) > SPI_BYTE_TIMEOUT_US) return SPI_SERVE_TIMEOUT;
     }
-    // Discard the dummy byte the master clocked in while reading the response
+    // Discard the dummy byte clocked in alongside our response
     while (hw->sr & SPI_SSPSR_RNE_BITS) {
         (void)hw->dr;
     }
-    return true;
+    return SPI_SERVE_SENT;
 }
 
 void SPISlaveUpdate() {
     spi_hw_t *hw = spi_get_hw(spi1);
 
     if (gpio_get(PIN_CS)) {
-        // Idle. Anything left in the FIFOs means an aborted or oversized
-        // transaction — flush so the next frame starts aligned.
-        if ((hw->sr & SPI_SSPSR_RNE_BITS) || !(hw->sr & SPI_SSPSR_TFE_BITS)) {
+        // Idle. Unconsumed RX bytes mean an aborted or oversized transaction;
+        // a lone leftover TX byte is the expected tail of a read burst (the
+        // speculatively-queued next byte the master chose not to clock) and is
+        // flushed without flagging an error.
+        bool rxLeftover = (hw->sr & SPI_SSPSR_RNE_BITS) != 0;
+        bool txLeftover = (hw->sr & SPI_SSPSR_TFE_BITS) == 0;
+        if (rxLeftover || txLeftover) {
             spiFlushFifos();
-            regMap[REG_ERROR] |= ERR_SPI_DESYNC;
+            if (rxLeftover) regMap[REG_ERROR] |= ERR_SPI_DESYNC;
         }
         return;
     }
@@ -152,43 +193,25 @@ void SPISlaveUpdate() {
     uint8_t addr = cmd & SPI_ADDR_MASK;
 
     if (isRead) {
-        uint8_t val = regMap[addr];
-
-        // L-byte read latches the H byte; H-byte read returns the latch,
-        // so a 16-bit ADC value can't tear across the two transactions
-        if (addr >= REG_ADC0_L && addr <= REG_ADC3_H) {
-            uint8_t idx = (uint8_t)((addr - REG_ADC0_L) >> 1);
-            if (((addr - REG_ADC0_L) & 1) == 0) {
-                adcLatchH[idx] = regMap[addr + 1];
-            } else {
-                val = adcLatchH[idx];
+        // Auto-incrementing burst read: serve regMap[addr], addr+1, addr+2 …
+        // one byte per clocked byte until the master deasserts CS. The address
+        // wraps within the 7-bit space; a single read is just a burst of one.
+        uint8_t cur = addr;
+        for (;;) {
+            SpiServe r = spiServeReadByte(spiReadRegister(cur));
+            if (r == SPI_SERVE_SENT) {
+                spiReadClear(cur);
+                cur = (uint8_t)((cur + 1) & SPI_ADDR_MASK);
+                continue;
             }
-        }
-
-        // Byte-0 read latches the upper 3 bytes; later byte reads return the
-        // latch, so a 32-bit counter/position can't tear across transactions
-        if (addr >= REG_CNT0_0 && addr <= REG_CNT_END) {
-            uint8_t idx = (uint8_t)((addr - REG_CNT0_0) >> 2);
-            uint8_t off = (uint8_t)((addr - REG_CNT0_0) & 3);
-            if (off == 0) {
-                cntLatch[idx][0] = regMap[addr + 1];
-                cntLatch[idx][1] = regMap[addr + 2];
-                cntLatch[idx][2] = regMap[addr + 3];
-            } else {
-                val = cntLatch[idx][off - 1];
+            if (r == SPI_SERVE_TIMEOUT) {
+                regMap[REG_ERROR] |= ERR_SPI_TIMEOUT;
             }
+            break; // SPI_SERVE_CSEND = clean end of burst
         }
-
-        if (!spiWriteByteBlocking(val)) {
-            return;
-        }
-
-        if (addr == REG_INT_FLAGS) {
-            regMap[REG_INT_FLAGS] = 0;
-        }
-        if (addr == REG_ERROR) {
-            regMap[REG_ERROR] = 0;
-        }
+        // Drop the speculatively-queued byte the master never clocked so the
+        // next frame starts aligned regardless of when the idle poll runs.
+        spiFlushFifos();
     } else {
         uint8_t val = 0;
         if (!spiReadByteBlocking(&val)) {
