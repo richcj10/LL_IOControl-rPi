@@ -61,7 +61,10 @@ static void gpioCallback(uint gpio, uint32_t events) {
         uint8_t a = gpio_get(INPUT_PINS[2 * p]) ? 1 : 0;
         uint8_t b = gpio_get(INPUT_PINS[2 * p + 1]) ? 1 : 0;
         uint8_t cur = (uint8_t)((a << 1) | b);
-        encPos[p] += QUAD_TABLE[(encPrevAB[p] << 2) | cur];
+        // Accumulate modulo 2^32 (defined wrap, no signed-overflow UB). Position
+        // wraps at ±2^31; the host reads motion with delta math across the wrap.
+        int8_t step = QUAD_TABLE[(encPrevAB[p] << 2) | cur];
+        encPos[p] = (int32_t)((uint32_t)encPos[p] + (uint32_t)(int32_t)step);
         encPrevAB[p] = cur;
     }
 }
@@ -270,9 +273,12 @@ void applyOutput(uint8_t channel, uint8_t mode, uint8_t value) {
         gpio_put(pin, value ? 1 : 0);
     } else {
         gpio_set_function(pin, GPIO_FUNC_PWM);
-        // Scale 0-255 duty byte to actual wrap range for this slice
-        uint16_t level = (uint16_t)(((uint32_t)value * ((uint32_t)sliceWrap[slice] + 1)) / 255);
-        pwm_set_chan_level(slice, chan, level);
+        // Scale 0-255 duty byte to the slice's wrap range, then clamp: at
+        // value==255 with wrap==65535 the product is 65536, which would truncate
+        // to 0 (full-off) in the 16-bit level register. Clamp to wrap (~100%).
+        uint32_t level = ((uint32_t)value * ((uint32_t)sliceWrap[slice] + 1)) / 255;
+        if (level > sliceWrap[slice]) level = sliceWrap[slice];
+        pwm_set_chan_level(slice, chan, (uint16_t)level);
     }
 }
 

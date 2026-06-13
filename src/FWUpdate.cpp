@@ -10,6 +10,9 @@
 // loop. 4 KB bounds the SPI streaming burst and is LittleFS-friendly.
 #define FW_BUF_SIZE     4096
 #define FW_STAGING_PATH "/fw_update.img"
+// Auto-abort a session abandoned mid-stream so the inputs (suspended at BEGIN)
+// are restored without needing a power cycle.
+#define FW_SESSION_TIMEOUT_MS 30000u
 
 static uint8_t  fwBuf[FW_BUF_SIZE];
 static volatile uint16_t fwBufLen = 0; // only touched from the main-loop thread
@@ -17,6 +20,7 @@ static bool     fwSession = false;
 static bool     fwMounted = false;
 static File     fwFile;
 static uint32_t fwCrc;                  // running CRC-32 state (pre-final XOR)
+static uint32_t fwLastActivity;         // millis() of last BEGIN / block flush
 
 // Reflected CRC-32 (poly 0xEDB88320) — must match the host and PicoOTA's OTACRC32.
 static void crcReset() { fwCrc = 0xFFFFFFFFu; }
@@ -47,15 +51,18 @@ void FWUpdateInit() {
 }
 
 // Called per clocked byte from the SPI streaming path. Kept tiny and flash-free.
-void FWUpdateFeed(uint8_t b) {
-    if (!fwSession) return; // ignore stray data outside a session
+// Returns false when no session is active or the block buffer is full, so the
+// SPI streaming loop stops consuming.
+bool FWUpdateFeed(uint8_t b) {
+    if (!fwSession) return false; // ignore stray data outside a session
     if (fwBufLen < FW_BUF_SIZE) {
         fwBuf[fwBufLen++] = b;
-    } else {
-        // Block larger than the buffer — host must keep blocks <= FW_BUF_SIZE
-        regMap[REG_ERROR]     |= ERR_FW;
-        regMap[REG_FW_STATUS]  = FW_ST_ERROR;
+        return true;
     }
+    // Block larger than the buffer — host must keep blocks <= FW_BUF_SIZE
+    regMap[REG_ERROR]     |= ERR_FW;
+    regMap[REG_FW_STATUS]  = FW_ST_ERROR;
+    return false;
 }
 
 static void fwFlushBlock() {
@@ -67,12 +74,16 @@ static void fwFlushBlock() {
     if (w != n) { fwFail(); return; }
     crcAdd(fwBuf, n);
     fwBufLen = 0;
+    fwLastActivity = millis();
     regMap[REG_FW_STATUS] = FW_ST_READY;
 }
 
 static void fwBegin() {
     if (!fwMounted) fwMounted = LittleFS.begin();
     if (!fwMounted) { fwFail(); return; }
+
+    // Close any handle left open by a prior aborted / re-issued BEGIN.
+    if (fwFile) fwFile.close();
 
     // Quiesce inputs: no flash-resident ISR should run during LittleFS writes.
     DigitalIOSuspendInputs();
@@ -84,6 +95,7 @@ static void fwBegin() {
     crcReset();
     fwBufLen  = 0;
     fwSession = true;
+    fwLastActivity = millis();
     regMap[REG_FW_STATUS] = FW_ST_READY;
 }
 
@@ -138,5 +150,11 @@ void FWUpdateUpdate() {
     // Flush a streamed block once the burst has ended (CS deasserted).
     if (fwSession && fwBufLen > 0) {
         fwFlushBlock();
+    }
+
+    // Abandoned-session watchdog: if no BEGIN/block progress for too long,
+    // auto-abort so the suspended inputs are restored without a power cycle.
+    if (fwSession && (millis() - fwLastActivity) > FW_SESSION_TIMEOUT_MS) {
+        fwFail();
     }
 }

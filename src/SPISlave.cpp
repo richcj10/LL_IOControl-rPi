@@ -26,6 +26,10 @@ volatile uint8_t fwCmdPending = 0;
 static uint8_t adcLatchH[4];
 // Upper 3 bytes latched on the byte-0 read so 32-bit counters can't tear
 static uint8_t cntLatch[4][3];
+// Base address of the most recent multi-byte latch. A follow-on byte returns
+// the latch only if it continues this base, so a standalone / out-of-order
+// high-byte read returns live data instead of a stale latch.
+static uint8_t lastLatchBase = 0xFF;
 
 static bool isReadOnly(uint8_t addr) {
     if (addr == REG_DEVICE_ID)  return true;
@@ -112,17 +116,20 @@ static bool spiReadByteBlocking(uint8_t *out) {
 static uint8_t spiReadRegister(uint8_t addr) {
     uint8_t val = regMap[addr];
 
-    // L-byte read latches the H byte; H-byte read returns the latch
+    // L-byte read latches the H byte; an H-byte read returns that latch only if
+    // it directly follows its L byte (same base), else it returns live data.
     if (addr >= REG_ADC0_L && addr <= REG_ADC3_H) {
         uint8_t idx = (uint8_t)((addr - REG_ADC0_L) >> 1);
         if (((addr - REG_ADC0_L) & 1) == 0) {
             adcLatchH[idx] = regMap[addr + 1];
-        } else {
+            lastLatchBase  = addr;
+        } else if (lastLatchBase == (uint8_t)(addr - 1)) {
             val = adcLatchH[idx];
         }
     }
 
-    // Byte-0 read latches the upper 3 bytes; later byte reads return the latch
+    // Byte-0 read latches the upper 3 bytes; a follow-on byte returns the latch
+    // only if it continues that same byte-0 read, else it returns live data.
     if (addr >= REG_CNT0_0 && addr <= REG_CNT_END) {
         uint8_t idx = (uint8_t)((addr - REG_CNT0_0) >> 2);
         uint8_t off = (uint8_t)((addr - REG_CNT0_0) & 3);
@@ -130,7 +137,8 @@ static uint8_t spiReadRegister(uint8_t addr) {
             cntLatch[idx][0] = regMap[addr + 1];
             cntLatch[idx][1] = regMap[addr + 2];
             cntLatch[idx][2] = regMap[addr + 3];
-        } else {
+            lastLatchBase    = addr;
+        } else if (lastLatchBase == (uint8_t)(addr - off)) {
             val = cntLatch[idx][off - 1];
         }
     }
@@ -213,11 +221,18 @@ void SPISlaveUpdate() {
         // one byte per clocked byte until the master deasserts CS. The address
         // wraps within the 7-bit space; a single read is just a burst of one.
         uint8_t cur = addr;
+        unsigned served = 0;
         for (;;) {
             SpiServe r = spiServeReadByte(spiReadRegister(cur));
             if (r == SPI_SERVE_SENT) {
                 spiReadClear(cur);
                 cur = (uint8_t)((cur + 1) & SPI_ADDR_MASK);
+                // Bound the burst so a master that clocks forever can't starve
+                // the main loop. The whole map is 128 bytes; 256 is ample.
+                if (++served >= 256) {
+                    regMap[REG_ERROR] |= ERR_SPI_DESYNC;
+                    break;
+                }
                 continue;
             }
             if (r == SPI_SERVE_TIMEOUT) {
@@ -236,7 +251,10 @@ void SPISlaveUpdate() {
             uint8_t b;
             SpiServe r = spiRecvStreamByte(&b);
             if (r == SPI_SERVE_SENT) {
-                FWUpdateFeed(b);
+                // Stop consuming once the block buffer is full (or no session is
+                // active): bounds the loop so a runaway master can't starve the
+                // main loop, and discards over-sized blocks.
+                if (!FWUpdateFeed(b)) break;
                 continue;
             }
             if (r == SPI_SERVE_TIMEOUT) {

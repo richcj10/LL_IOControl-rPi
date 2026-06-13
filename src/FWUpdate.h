@@ -9,4 +9,4 @@
 
 void FWUpdateInit();          // mount LittleFS, status = IDLE
 void FWUpdateUpdate();        // main loop: process a pending command + flush blocks
-void FWUpdateFeed(uint8_t b); // SPI handler: push one streamed image byte to the buffer
+bool FWUpdateFeed(uint8_t b); // SPI handler: buffer one streamed byte; false = full/no session

@@ -201,6 +201,10 @@ Signed 32-bit, little-endian. Encoder position (ENCODER mode) or last measured
 frequency in Hz (FREQUENCY mode); reads 0 in LEVEL mode. Reading byte 0
 latches bytes 1–3.
 
+Encoder position is a free-running counter that **wraps modulo 2³² at ±2³¹**.
+For continuous motion, track movement with delta math on the host
+(`(int32_t)(new - old)`), which is correct across the wrap.
+
 | Addr range  | Name        | Acc | Input |
 |-------------|-------------|-----|-------|
 | 0x50–0x53   | `REG_CNT0_0`| R   | 0     |
@@ -397,6 +401,10 @@ GZIP header and decompresses during the copy.
 > **During an update, normal I/O is suspended** (inputs/interrupts are quiesced
 > so no flash-resident ISR runs during LittleFS writes). Do not expect live I/O
 > between `BEGIN` and the post-`COMMIT` reboot.
+
+> **Session watchdog:** an update with no `BEGIN`/block progress for 30 s is
+> auto-aborted — `REG_FW_STATUS` goes to `ERROR` (`ERR_FW` set) and the inputs
+> are restored. Send `ABORT` then restart from `BEGIN` to retry.
 
 > **Blocks are CS-delimited.** Each burst write to `REG_FW_DATA_PORT` is one
 > block; keep it ≤ 4096 bytes or the device sets `ERR_FW` / `FW_ST_ERROR`.
